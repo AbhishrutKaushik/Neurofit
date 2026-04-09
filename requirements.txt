@@ -2,4 +2,5 @@ opencv-python>=4.9.0
 mediapipe>=0.10.33
 numpy>=1.26.0
 streamlit>=1.35.0
+streamlit-webrtc>=0.47.0
 certifi>=2024.0.0
