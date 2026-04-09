@@ -11,7 +11,12 @@ Run with:
 from __future__ import annotations
 
 import av
+from pathlib import Path
+
+from dotenv import load_dotenv
 import streamlit as st
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
 from streamlit_webrtc import webrtc_streamer, WebRtcMode
 
 from vision_engine import PoseTracker
