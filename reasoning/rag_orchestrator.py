@@ -43,7 +43,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional
 
 from dotenv import load_dotenv
 
@@ -409,18 +409,24 @@ class SRRAGOrchestrator:
         graph.add_node("proposer", self._proposer_node)
         graph.add_node("refuter", self._refuter_node)
         graph.add_node("judge", self._judge_node)
+        # Fallback node: handles the exhausted-retries case.
+        # State writes here ARE persisted (unlike in a router function).
+        graph.add_node("fallback", self._fallback_node)
 
         # START → Proposer → Refuter → Judge
         graph.add_edge(START, "proposer")
         graph.add_edge("proposer", "refuter")
         graph.add_edge("refuter", "judge")
 
-        # Judge → END (SAFE) or Judge → Proposer (UNSAFE, with retry cap)
+        # Judge → END (SAFE) | Proposer (UNSAFE, retries left) | Fallback (exhausted)
         graph.add_conditional_edges(
             "judge",
             self._route_after_judge,
-            {"SAFE": END, "UNSAFE": "proposer"},
+            {"SAFE": END, "UNSAFE": "proposer", "FALLBACK": "fallback"},
         )
+
+        # Fallback always terminates
+        graph.add_edge("fallback", END)
 
         return graph.compile()
 
@@ -569,12 +575,19 @@ class SRRAGOrchestrator:
              "Put the approved cue in final_coaching_cue.\n"
              "  UNSAFE — The cue violates guidelines or could cause injury. "
              "Set final_coaching_cue to an empty string.\n\n"
-             "For deadlift lumbar rounding, prefer cues aligned with NASM: "
-             "chest up, brace core, neutral spine, bar close.\n\n"
+             "CRITICAL RULES:\n"
+             "1. If the Refuter says NO_OBJECTION, you MUST return SAFE "
+             "unless you independently identify a clear, specific safety "
+             "violation not mentioned by the Refuter.  Do NOT invent new "
+             "objections when the Refuter found none.\n"
+             "2. Judge the cue against the ACTUAL exercise in the telemetry "
+             "(squat, deadlift, bicep curl, etc.).  Do not apply guidelines "
+             "from one exercise to a different exercise.\n"
+             "3. A cue is SAFE if it is actionable, injury-preventing, and "
+             "consistent with the retrieved guidelines for THIS exercise.\n\n"
              "HALLUCINATION GUARDRAILS: Never approve a cue that treats "
-             "fantasy injuries as real.  Never approve a cue that "
-             "contradicts the Refuter when the Refuter cites a specific "
-             "guideline."),
+             "a fantasy injury as real.  Never reject a cue solely because "
+             "it doesn't match a different exercise's preferred phrasing."),
             ("human",
              "PROPOSED CUE:\n{cue}\n\n"
              "REFUTER ANALYSIS:\n{refutation}\n\n"
@@ -627,19 +640,46 @@ class SRRAGOrchestrator:
         }
 
     # ------------------------------------------------------------------
-    # Routing: Judge → END or Judge → Proposer
+    # Fallback node — triggered when retries are exhausted
+    # ------------------------------------------------------------------
+
+    def _fallback_node(self, state: CoachingState) -> dict:
+        """Emit a safe, generic coaching cue when the Proposer/Judge
+        debate cannot reach consensus within MAX_RETRIES attempts.
+
+        This is a proper LangGraph NODE so its return dict IS written
+        back to the graph state (unlike mutations inside a router
+        function, which are silently discarded).
+        """
+        agent_log(
+            "FALLBACK", RED,
+            "All retries exhausted — writing safe fallback cue to state.",
+        )
+        return {
+            "final_coaching": (
+                "Focus on controlled breathing and maintain a neutral spine.  "
+                "If you feel any discomfort, stop and rest."
+            ),
+            "is_safe": True,
+            "judge_verdict": "SAFE",
+        }
+
+    # ------------------------------------------------------------------
+    # Routing: Judge → END | Proposer | Fallback
     # ------------------------------------------------------------------
 
     def _route_after_judge(
         self, state: CoachingState,
-    ) -> Literal["SAFE", "UNSAFE"]:
-        """Binary routing from the Judge node.
+    ) -> Literal["SAFE", "UNSAFE", "FALLBACK"]:
+        """Route from the Judge node.
 
-        SAFE  → END  (approved cue delivered)
-        UNSAFE → Proposer  (retry, up to MAX_RETRIES)
+        SAFE    → END      (cue approved, pipeline done)
+        UNSAFE  → proposer (retry if budget allows)
+        FALLBACK → fallback (retries exhausted — let the node write state)
 
-        If retries are exhausted, emit a safe fallback cue and route
-        to END so the graph terminates.
+        NOTE: Do NOT mutate ``state`` here.  LangGraph router functions
+        are pure routing functions; any writes are silently discarded.
+        Use the ``fallback`` node for state mutations.
         """
         if state["judge_verdict"] == "SAFE":
             return "SAFE"
@@ -649,15 +689,9 @@ class SRRAGOrchestrator:
             agent_log(
                 "ROUTER", RED,
                 f"Max retries ({self.MAX_RETRIES}) exhausted — "
-                "emitting safe fallback cue.",
+                "routing to fallback node.",
             )
-            state["final_coaching"] = (
-                "Focus on controlled breathing and maintain a neutral spine.  "
-                "If you feel any discomfort, stop and rest."
-            )
-            state["is_safe"] = True
-            state["judge_verdict"] = "SAFE"
-            return "SAFE"
+            return "FALLBACK"
 
         agent_log(
             "ROUTER", YELLOW,
