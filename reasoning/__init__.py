@@ -1,5 +1,7 @@
-"""Reasoning layer (SR-RAG).  Lazy import avoids runpy warnings when using
-``python -m reasoning.rag_orchestrator``."""
+"""Reasoning layer — Phase 5 Intelligent Coaching Brain.
+
+Lazy import avoids pulling in heavy LangChain/Groq deps at module scan time.
+"""
 
 from __future__ import annotations
 
