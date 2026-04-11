@@ -10,6 +10,7 @@ python-dotenv>=1.0.0
 # ── Phase 3: SMPL-X Volumetric (GPU lab) ─────────────────────
 torch>=2.0.0
 smplx>=0.1.28
+trimesh[easy]>=4.0.0
 
 # ── Phase 4: SR-RAG Pipeline (Groq / Llama 3.1) ───────────────
 langchain>=0.3.0

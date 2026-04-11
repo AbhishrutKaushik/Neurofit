@@ -316,6 +316,83 @@ class SMPLXSpotChecker:
             "mock": False,
         }
 
+    def get_mesh_data(
+        self,
+        image_array: np.ndarray,
+        mediapipe_landmarks: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Run inference and return the full mesh geometry alongside metrics.
+
+        This is the method used by the Phase-3 validation script to
+        extract vertices and faces for 3-D visualisation with trimesh.
+
+        Returns
+        -------
+        dict with keys:
+            vertices  : np.ndarray (10475, 3) — mesh verts in metres
+            faces     : np.ndarray (F, 3)     — triangle indices
+            joints_3d : np.ndarray (J, 3)     — body joints in metres
+            metrics   : dict                  — same as process_frame output
+            device    : str
+            elapsed_s : float                 — wall-clock seconds for the
+                                                forward pass only
+        Raises ``RuntimeError`` if mock_mode is active (no mesh to return).
+        """
+        if self.mock_mode:
+            raise RuntimeError(
+                "get_mesh_data() requires MOCK_MODE=False with a real "
+                "SMPL-X model loaded on GPU/CPU."
+            )
+
+        import time as _time
+        torch = self._torch
+
+        betas = torch.zeros(1, 10, dtype=torch.float32, device=self._device)
+        body_pose = torch.zeros(1, 63, dtype=torch.float32, device=self._device)
+        global_orient = torch.zeros(1, 3, dtype=torch.float32, device=self._device)
+
+        if mediapipe_landmarks is not None:
+            body_pose = self._mediapipe_to_pose_hint(mediapipe_landmarks, body_pose)
+
+        if self._device.type == "cuda":
+            torch.cuda.synchronize()
+
+        t0 = _time.perf_counter()
+
+        with torch.no_grad():
+            output = self._body_model(
+                betas=betas,
+                body_pose=body_pose,
+                global_orient=global_orient,
+            )
+
+        if self._device.type == "cuda":
+            torch.cuda.synchronize()
+
+        elapsed = _time.perf_counter() - t0
+
+        vertices = output.vertices[0].cpu().numpy()   # (10475, 3)
+        joints_3d = output.joints[0].cpu().numpy()     # (J, 3)
+
+        # SMPL-X face array lives on the model layer itself.
+        faces = self._body_model.faces                  # (F, 3) int32
+
+        alignment_score, posture_warning = self._calculate_spinal_alignment(joints_3d)
+        shoulder_sym = self._shoulder_symmetry(joints_3d)
+
+        return {
+            "vertices": vertices,
+            "faces": faces,
+            "joints_3d": joints_3d,
+            "metrics": {
+                "spinal_alignment_score": alignment_score,
+                "posture_warning": posture_warning,
+                "shoulder_symmetry": shoulder_sym,
+            },
+            "device": str(self._device),
+            "elapsed_s": round(elapsed, 4),
+        }
+
     # ------------------------------------------------------------------
     # Biomechanical extraction helpers
     # ------------------------------------------------------------------
