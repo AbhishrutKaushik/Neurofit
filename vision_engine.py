@@ -68,8 +68,8 @@ JOINT_TRIPLETS: dict[str, tuple[int, int, int]] = {
 # Curl thresholds — tuned for seated / restricted ROM
 # ---------------------------------------------------------------------------
 
-CURL_UP_THRESHOLD: float = 40.0    # elbow ≤ this → arm is curled (UP)
-CURL_DOWN_THRESHOLD: float = 140.0  # elbow ≥ this → arm is extended (DOWN)
+CURL_UP_THRESHOLD: float = 70.0    # elbow ≤ this → arm is curled (UP)
+CURL_DOWN_THRESHOLD: float = 110.0  # elbow ≥ this → arm is extended (DOWN)
 
 FATIGUE_MULTIPLIER: float = 1.3
 REP_HISTORY_SIZE: int = 8
@@ -236,6 +236,11 @@ class PoseTracker:
         telemetry = self._build_telemetry(angles)
         self.latest_telemetry = telemetry
         return frame, telemetry
+
+    def reset(self) -> None:
+        """Reset rep counter, fatigue state, and telemetry for a new session."""
+        self.rep_state = RepState()
+        self.latest_telemetry = None
 
     def close(self) -> None:
         self._landmarker.close()

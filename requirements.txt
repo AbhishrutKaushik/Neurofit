@@ -9,6 +9,7 @@ python-dotenv>=1.0.0
 
 # ── Phase 3: SMPL-X Volumetric (GPU lab) ─────────────────────
 torch>=2.0.0
+torchvision>=0.15.0
 smplx>=0.1.28
 trimesh[easy]>=4.0.0
 
@@ -20,3 +21,9 @@ langchain-community>=0.3.0
 langchain-huggingface>=0.1.0
 faiss-cpu>=1.7.0
 sentence-transformers>=3.0.0
+
+# ── Phase 6: FitCoin Gamification ──────────────────────────────
+openfoodfacts>=5.0.0
+
+# ── Phase 7: Audio Coaching ────────────────────────────────────
+pyttsx3>=2.90
