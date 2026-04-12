@@ -11,13 +11,17 @@ Expected directory layout
 ─────────────────────────
     datasets/
     └── videos/
-        ├── bicep_curl/
-        │   ├── clip_001.mp4
-        │   └── clip_002.avi
-        ├── squat/
-        │   └── clip_001.mp4
-        └── deadlift/
-            └── ...
+        └── raw_data/
+            ├── data-crawl/
+            │   ├── squat/
+            │   │   └── video1.mp4
+            │   └── bicep_curl/
+            │       └── video2.mp4
+            └── data-btc/
+                └── deadlift/
+                    └── video3.mp4
+
+The label is extracted from the **direct parent folder** of each .mp4 file.
 
 Run:
     python scripts/extract_pose_data.py
@@ -37,7 +41,7 @@ import mediapipe as mp
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-VIDEO_DIR = PROJECT_ROOT / "datasets" / "videos"
+VIDEO_DIR = PROJECT_ROOT / "datasets" / "videos" / "raw_data"
 OUTPUT_CSV = PROJECT_ROOT / "datasets" / "pose_dataset.csv"
 
 NUM_LANDMARKS = 33
@@ -47,18 +51,19 @@ HEADER = [f"lm{i}_{axis}" for i in range(NUM_LANDMARKS) for axis in ("x", "y", "
 
 
 def collect_videos(root: Path) -> list[tuple[Path, str]]:
-    """Return [(video_path, exercise_label), ...] sorted deterministically."""
-    pairs: list[tuple[Path, str]] = []
+    """Recursively find all .mp4 files under *root* and extract the exercise
+    label from each file's direct parent folder name.
+
+    e.g.  .../data-crawl/squat/video1.mp4  →  label = "squat"
+    """
     if not root.is_dir():
         print(f"[ERROR] Video directory not found: {root}", file=sys.stderr)
         sys.exit(1)
-    for exercise_dir in sorted(root.iterdir()):
-        if not exercise_dir.is_dir():
-            continue
-        label = exercise_dir.name
-        for vf in sorted(exercise_dir.iterdir()):
-            if vf.suffix.lower() in (".mp4", ".avi", ".mov", ".mkv", ".webm"):
-                pairs.append((vf, label))
+
+    pairs: list[tuple[Path, str]] = []
+    for vf in sorted(root.rglob("*.mp4")):
+        label = vf.parent.name
+        pairs.append((vf, label))
     return pairs
 
 
