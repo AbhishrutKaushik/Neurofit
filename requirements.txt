@@ -27,3 +27,10 @@ openfoodfacts>=5.0.0
 
 # ── Phase 7: Audio Coaching ────────────────────────────────────
 pyttsx3>=2.90
+
+# ── Phase 8: Classifier Training & NASM Ingestion ─────────────
+pandas>=2.0.0
+scikit-learn>=1.3.0
+tqdm>=4.66.0
+pypdf>=4.0.0
+langchain-ollama>=0.2.0

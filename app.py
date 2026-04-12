@@ -766,7 +766,12 @@ with tab_workout:
                 f'{_vs.last_form_score:.0%}',
             )
 
-            st.info(f"Curl Position: **{telemetry['curl_position']}**")
+            ex_name = telemetry.get("exercise", "unknown").replace("_", " ").title()
+            ex_conf = telemetry.get("exercise_confidence", 0.0)
+            phase = telemetry.get("phase", "UNKNOWN")
+            st.info(
+                f"Exercise: **{ex_name}** ({ex_conf:.0%}) · Phase: **{phase}**"
+            )
 
             st.markdown("**Joint Angles**")
             angle_cols = st.columns(4)

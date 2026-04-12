@@ -1,9 +1,15 @@
 """
 vision_engine.py — Edge Perception Layer for Neuro-Fit
+======================================================
 
 Pipeline:
   • BlazePose via PoseLandmarker (Tasks API, VIDEO mode)
-  • Bicep-curl rep counting via elbow-angle state machine (UP ↔ DOWN)
+  • **PyTorch exercise classifier** — predicts the current exercise from
+    99 world-landmark features.  Falls back to ``"unknown"`` when the
+    checkpoint is absent (Mac dev mode / first run).
+  • **Generic rep counter** — per-exercise angle-threshold config selects
+    which joint to track; a two-phase state machine (EXTENDED ↔ CONTRACTED)
+    counts reps for any exercise without hardcoded curl logic.
   • VBT fatigue flag: current rep > 1.3 × rolling mean duration
   • JSON-serializable telemetry dict
 """
@@ -11,6 +17,7 @@ Pipeline:
 from __future__ import annotations
 
 import json
+import logging
 import ssl
 import time
 import urllib.request
@@ -23,6 +30,18 @@ from typing import Optional
 import certifi
 import cv2
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+# ── Lazy torch import — populated once by _load_classifier() ─────────
+_torch_available = False
+try:
+    import torch
+    import torch.nn as nn
+    _torch_available = True
+except ImportError:
+    pass
+
 from mediapipe.tasks.python.core import base_options as base_options_lib
 from mediapipe.tasks.python.vision import (
     PoseLandmarker,
@@ -65,17 +84,57 @@ JOINT_TRIPLETS: dict[str, tuple[int, int, int]] = {
 }
 
 # ---------------------------------------------------------------------------
-# Curl thresholds — tuned for seated / restricted ROM
+# Exercise-specific rep counting configs
 # ---------------------------------------------------------------------------
+# ``primary_angles``: which JOINT_TRIPLETS angles to average for the phase
+# detector.  ``contracted``: angle ≤ this → joint is contracted (peak effort
+# for curls, bottom of squat, etc.).  ``extended``: angle ≥ this → joint is
+# fully extended.  A full rep is EXTENDED → CONTRACTED → EXTENDED.
 
-CURL_UP_THRESHOLD: float = 70.0    # elbow ≤ this → arm is curled (UP)
-CURL_DOWN_THRESHOLD: float = 110.0  # elbow ≥ this → arm is extended (DOWN)
+EXERCISE_REP_CONFIG: dict[str, dict] = {
+    "bicep_curl": {
+        "primary_angles": ["left_elbow", "right_elbow"],
+        "contracted": 70.0,
+        "extended": 110.0,
+    },
+    "squat": {
+        "primary_angles": ["left_knee", "right_knee"],
+        "contracted": 100.0,
+        "extended": 160.0,
+    },
+    "pushup": {
+        "primary_angles": ["left_elbow", "right_elbow"],
+        "contracted": 90.0,
+        "extended": 150.0,
+    },
+    "deadlift": {
+        "primary_angles": ["left_hip", "right_hip"],
+        "contracted": 100.0,
+        "extended": 160.0,
+    },
+    "shoulder_press": {
+        "primary_angles": ["left_elbow", "right_elbow"],
+        "contracted": 90.0,
+        "extended": 155.0,
+    },
+    "lunge": {
+        "primary_angles": ["left_knee", "right_knee"],
+        "contracted": 100.0,
+        "extended": 155.0,
+    },
+}
+
+DEFAULT_REP_CONFIG: dict = {
+    "primary_angles": ["left_elbow", "right_elbow"],
+    "contracted": 70.0,
+    "extended": 130.0,
+}
 
 FATIGUE_MULTIPLIER: float = 1.3
 REP_HISTORY_SIZE: int = 8
 
 # ---------------------------------------------------------------------------
-# Model download
+# MediaPipe model download
 # ---------------------------------------------------------------------------
 
 POSE_MODEL_URL = (
@@ -108,27 +167,67 @@ def ensure_pose_model_path(cache_dir: Optional[Path] = None) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Curl state machine
+# PyTorch exercise classifier (mirrored architecture from training script)
 # ---------------------------------------------------------------------------
 
 
-class CurlPosition(Enum):
-    """Binary flag: is the arm UP (curled) or DOWN (extended)?"""
+if _torch_available:
+
+    class ExerciseClassifier(nn.Module):
+        """MLP with BatchNorm + Dropout — identical architecture to the
+        training script so ``load_state_dict`` works without remapping."""
+
+        def __init__(
+            self,
+            n_features: int = 99,
+            n_classes: int = 6,
+            hidden_dims: list[int] | None = None,
+            dropout: float = 0.3,
+        ) -> None:
+            super().__init__()
+            dims = hidden_dims or [256, 128, 64]
+            layers: list[nn.Module] = []
+            in_dim = n_features
+            for h in dims:
+                layers.extend([
+                    nn.Linear(in_dim, h),
+                    nn.BatchNorm1d(h),
+                    nn.ReLU(inplace=True),
+                    nn.Dropout(dropout),
+                ])
+                in_dim = h
+            layers.append(nn.Linear(in_dim, n_classes))
+            self.net = nn.Sequential(*layers)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.net(x)
+
+
+# ---------------------------------------------------------------------------
+# Generic phase detector (replaces old CurlPosition state machine)
+# ---------------------------------------------------------------------------
+
+
+class Phase(Enum):
     UNKNOWN = auto()
-    UP = auto()
-    DOWN = auto()
+    EXTENDED = auto()
+    CONTRACTED = auto()
 
 
 @dataclass
 class RepState:
-    curl_position: CurlPosition = CurlPosition.UNKNOWN
+    phase: Phase = Phase.UNKNOWN
     rep_count: int = 0
     phase_start_time: float = 0.0
     concentric_duration: float = 0.0
     eccentric_duration: float = 0.0
     current_rep_duration: float = 0.0
-    rep_durations: deque = field(default_factory=lambda: deque(maxlen=REP_HISTORY_SIZE))
+    rep_durations: deque = field(
+        default_factory=lambda: deque(maxlen=REP_HISTORY_SIZE)
+    )
     neuromuscular_fatigue: bool = False
+    detected_exercise: str = "unknown"
+    exercise_confidence: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +235,9 @@ class RepState:
 # ---------------------------------------------------------------------------
 
 
-def angle_between_3d_points(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+def angle_between_3d_points(
+    a: np.ndarray, b: np.ndarray, c: np.ndarray,
+) -> float:
     """Angle ∠ABC in degrees (b is the vertex)."""
     ba = a - b
     bc = c - b
@@ -179,21 +280,26 @@ def _draw_pose_skeleton(frame_bgr: np.ndarray, landmarks_norm: list) -> None:
 
 
 class PoseTracker:
-    """Real-time pose tracking with angle-based bicep-curl rep counting."""
+    """Real-time pose tracking with PyTorch exercise classification and
+    generic angle-based rep counting."""
 
     def __init__(
         self,
         model_path: Optional[Path | str] = None,
+        classifier_path: Optional[Path | str] = None,
         min_pose_detection_confidence: float = 0.5,
         min_pose_presence_confidence: float = 0.5,
         min_tracking_confidence: float = 0.5,
     ) -> None:
+        # ── MediaPipe PoseLandmarker ──────────────────────────────────
         path = Path(model_path) if model_path else ensure_pose_model_path()
         if not path.is_file():
             raise FileNotFoundError(f"Pose model not found: {path}")
 
         options = PoseLandmarkerOptions(
-            base_options=base_options_lib.BaseOptions(model_asset_path=str(path)),
+            base_options=base_options_lib.BaseOptions(
+                model_asset_path=str(path),
+            ),
             running_mode=RunningMode.VIDEO,
             min_pose_detection_confidence=min_pose_detection_confidence,
             min_pose_presence_confidence=min_pose_presence_confidence,
@@ -202,20 +308,85 @@ class PoseTracker:
         )
         self._landmarker = PoseLandmarker.create_from_options(options)
         self._video_ts_ms: int = 0
+
+        # ── PyTorch exercise classifier (optional) ────────────────────
+        self._classifier = None
+        self._idx_to_label: dict[int, str] = {}
+        self._norm_mean: Optional[np.ndarray] = None
+        self._norm_std: Optional[np.ndarray] = None
+        self._device = "cpu"
+        self._load_classifier(classifier_path)
+
+        # ── Rep tracking state ────────────────────────────────────────
         self.rep_state = RepState()
         self.latest_telemetry: Optional[dict] = None
 
-    # -- public API used by the WebRTC callback ------------------------------
+    # -- classifier loading ------------------------------------------------
 
-    def process_frame(self, frame: np.ndarray) -> tuple[np.ndarray, Optional[dict]]:
-        """Run pose estimation on a BGR frame (already read from camera).
+    def _load_classifier(self, override_path: Optional[Path | str]) -> None:
+        """Attempt to load the exercise classifier checkpoint.
 
-        Returns (annotated_bgr_frame, telemetry_dict_or_None).
+        Gracefully no-ops when torch is unavailable or the file is missing
+        (Mac dev mode) — exercise defaults to ``"unknown"``.
+        """
+        if not _torch_available:
+            return
+
+        ckpt_path = Path(override_path) if override_path else (
+            Path(__file__).resolve().parent / "models" / "exercise_classifier.pth"
+        )
+        if not ckpt_path.is_file():
+            logger.info(
+                "Classifier checkpoint not found at %s — "
+                "exercise classification disabled.", ckpt_path,
+            )
+            return
+
+        try:
+            self._device = "cuda" if torch.cuda.is_available() else "cpu"
+            ckpt = torch.load(
+                ckpt_path, map_location=self._device, weights_only=False,
+            )
+            model = ExerciseClassifier(
+                n_features=ckpt["n_features"],
+                n_classes=ckpt["n_classes"],
+                hidden_dims=ckpt["hidden_dims"],
+                dropout=ckpt["dropout"],
+            )
+            model.load_state_dict(ckpt["model_state_dict"])
+            model.to(self._device)
+            model.eval()
+
+            self._classifier = model
+            self._idx_to_label = ckpt["idx_to_label"]
+
+            if "norm_mean" in ckpt:
+                self._norm_mean = np.array(ckpt["norm_mean"], dtype=np.float32)
+                self._norm_std = np.array(ckpt["norm_std"], dtype=np.float32)
+
+            logger.info(
+                "Exercise classifier loaded (%d classes, device=%s): %s",
+                ckpt["n_classes"], self._device,
+                list(self._idx_to_label.values()),
+            )
+        except Exception as exc:
+            logger.warning("Classifier load failed: %s", exc)
+
+    # -- public API --------------------------------------------------------
+
+    def process_frame(
+        self, frame: np.ndarray,
+    ) -> tuple[np.ndarray, Optional[dict]]:
+        """Run pose estimation + exercise classification on a BGR frame.
+
+        Returns ``(annotated_bgr_frame, telemetry_dict_or_None)``.
         """
         frame = cv2.flip(frame, 1)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         rgb = np.ascontiguousarray(rgb)
-        mp_image = mp_image_module.Image(image_format=ImageFormat.SRGB, data=rgb)
+        mp_image = mp_image_module.Image(
+            image_format=ImageFormat.SRGB, data=rgb,
+        )
 
         self._video_ts_ms += 33
         result = self._landmarker.detect_for_video(mp_image, self._video_ts_ms)
@@ -231,7 +402,12 @@ class PoseTracker:
 
         world = result.pose_world_landmarks[0]
         angles = self._compute_angles(world)
-        self._update_curl_state_machine(angles)
+
+        exercise, confidence = self._classify_exercise(world)
+        self.rep_state.detected_exercise = exercise
+        self.rep_state.exercise_confidence = confidence
+
+        self._update_rep_state_machine(angles, exercise)
 
         telemetry = self._build_telemetry(angles)
         self.latest_telemetry = telemetry
@@ -245,7 +421,45 @@ class PoseTracker:
     def close(self) -> None:
         self._landmarker.close()
 
-    # -- internals -----------------------------------------------------------
+    # -- exercise classification -------------------------------------------
+
+    def _classify_exercise(
+        self, world_landmarks: list,
+    ) -> tuple[str, float]:
+        """Run the PyTorch MLP on the 99 world-landmark features.
+
+        Returns ``(exercise_name, confidence)`` or ``("unknown", 0.0)`` when
+        the classifier is unavailable.
+        """
+        if self._classifier is None:
+            return "bicep_curl", 0.0
+
+        features = []
+        for lm in world_landmarks:
+            features.extend([
+                float(lm.x or 0.0),
+                float(lm.y or 0.0),
+                float(lm.z or 0.0),
+            ])
+
+        feat_np = np.array(features, dtype=np.float32)
+
+        if self._norm_mean is not None and self._norm_std is not None:
+            feat_np = (feat_np - self._norm_mean) / self._norm_std
+
+        tensor = torch.tensor(feat_np, dtype=torch.float32).unsqueeze(0).to(
+            self._device,
+        )
+
+        with torch.no_grad():
+            logits = self._classifier(tensor)
+            probs = torch.softmax(logits, dim=-1)
+            conf, idx = probs.max(dim=-1)
+
+        label = self._idx_to_label.get(idx.item(), "unknown")
+        return label, round(conf.item(), 3)
+
+    # -- internals ---------------------------------------------------------
 
     def _xyz(self, lm) -> np.ndarray:
         return np.array(
@@ -262,57 +476,85 @@ class PoseTracker:
             angles[name] = round(angle_between_3d_points(a, b, c), 1)
         return angles
 
-    def _update_curl_state_machine(self, angles: dict[str, float]) -> None:
-        """Angle-based binary state machine: DOWN ↔ UP.
+    def _update_rep_state_machine(
+        self, angles: dict[str, float], exercise: str,
+    ) -> None:
+        """Generic two-phase rep counter.
 
-        A rep is counted on a full DOWN → UP → DOWN cycle.
-        Uses the *average* of left + right elbow angles.
+        Selects the primary joint angles and thresholds from
+        ``EXERCISE_REP_CONFIG`` based on the classified exercise, then runs
+        a simple EXTENDED ↔ CONTRACTED state machine.
+
+        A full rep = EXTENDED → CONTRACTED → EXTENDED.
         """
-        elbow_angle = (angles.get("left_elbow", 180.0) + angles.get("right_elbow", 180.0)) / 2.0
+        config = EXERCISE_REP_CONFIG.get(exercise, DEFAULT_REP_CONFIG)
+        primary_keys = config["primary_angles"]
+        contracted_thresh = config["contracted"]
+        extended_thresh = config["extended"]
+
+        avg_angle = float(np.mean(
+            [angles.get(k, 180.0) for k in primary_keys]
+        ))
+
         now = time.monotonic()
         state = self.rep_state
 
-        if state.curl_position == CurlPosition.UNKNOWN:
-            # Initialise based on first reading
-            if elbow_angle >= CURL_DOWN_THRESHOLD:
-                state.curl_position = CurlPosition.DOWN
-            elif elbow_angle <= CURL_UP_THRESHOLD:
-                state.curl_position = CurlPosition.UP
+        if state.phase == Phase.UNKNOWN:
+            if avg_angle >= extended_thresh:
+                state.phase = Phase.EXTENDED
+            elif avg_angle <= contracted_thresh:
+                state.phase = Phase.CONTRACTED
             state.phase_start_time = now
             return
 
-        # Transition DOWN → UP  (concentric phase complete)
-        if state.curl_position == CurlPosition.DOWN and elbow_angle <= CURL_UP_THRESHOLD:
+        # EXTENDED → CONTRACTED (concentric)
+        if (
+            state.phase == Phase.EXTENDED
+            and avg_angle <= contracted_thresh
+        ):
             state.concentric_duration = now - state.phase_start_time
-            state.curl_position = CurlPosition.UP
+            state.phase = Phase.CONTRACTED
             state.phase_start_time = now
 
-        # Transition UP → DOWN  (eccentric phase complete → 1 full rep)
-        elif state.curl_position == CurlPosition.UP and elbow_angle >= CURL_DOWN_THRESHOLD:
+        # CONTRACTED → EXTENDED (eccentric → 1 full rep)
+        elif (
+            state.phase == Phase.CONTRACTED
+            and avg_angle >= extended_thresh
+        ):
             state.eccentric_duration = now - state.phase_start_time
-            state.curl_position = CurlPosition.DOWN
+            state.phase = Phase.EXTENDED
             state.phase_start_time = now
 
-            state.current_rep_duration = state.concentric_duration + state.eccentric_duration
+            state.current_rep_duration = (
+                state.concentric_duration + state.eccentric_duration
+            )
             state.rep_count += 1
             state.rep_durations.append(state.current_rep_duration)
             self._evaluate_fatigue()
             self._log_rep(angles)
 
     def _log_rep(self, angles: dict[str, float]) -> None:
-        """Print a clean JSON payload to the terminal after every completed rep."""
         state = self.rep_state
+        config = EXERCISE_REP_CONFIG.get(
+            state.detected_exercise, DEFAULT_REP_CONFIG,
+        )
+        primary_keys = config["primary_angles"]
+        primary_avg = round(float(np.mean(
+            [angles.get(k, 0.0) for k in primary_keys]
+        )), 1)
+
         payload = {
-            "exercise": "bicep_curl",
+            "exercise": state.detected_exercise,
+            "exercise_confidence": state.exercise_confidence,
             "rep": state.rep_count,
             "rep_time": round(state.current_rep_duration, 3),
             "concentric_sec": round(state.concentric_duration, 3),
             "eccentric_sec": round(state.eccentric_duration, 3),
-            "avg_rep_time": round(float(np.mean(state.rep_durations)), 3),
-            "fatigue": state.neuromuscular_fatigue,
-            "elbow_angle_avg": round(
-                (angles.get("left_elbow", 0.0) + angles.get("right_elbow", 0.0)) / 2.0, 1
+            "avg_rep_time": round(
+                float(np.mean(state.rep_durations)), 3,
             ),
+            "fatigue": state.neuromuscular_fatigue,
+            "primary_angle_avg": primary_avg,
         }
         print(json.dumps(payload, indent=2), flush=True)
         if state.neuromuscular_fatigue:
@@ -336,8 +578,10 @@ class PoseTracker:
             else 0.0
         )
         return {
+            "exercise": state.detected_exercise,
+            "exercise_confidence": round(state.exercise_confidence, 3),
+            "phase": state.phase.name,
             "rep_count": state.rep_count,
-            "curl_position": state.curl_position.name,
             "angles_deg": angles,
             "concentric_sec": round(state.concentric_duration, 3),
             "eccentric_sec": round(state.eccentric_duration, 3),
