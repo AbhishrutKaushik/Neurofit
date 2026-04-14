@@ -59,7 +59,7 @@ def main() -> None:
     print(f"  Loaded {len(raw_docs)} pages from PDF.")
 
     # ── Chunk with RecursiveCharacterTextSplitter ─────────────────────
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,

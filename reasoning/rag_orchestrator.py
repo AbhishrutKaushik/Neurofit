@@ -64,6 +64,8 @@ from utils.logging_helpers import agent_log
 
 logger = logging.getLogger(__name__)
 
+_VECTOR_STORE_DIR = _PROJECT_ROOT / "vector_store"
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Pydantic schemas — structured LLM output
@@ -249,15 +251,80 @@ class SRRAGOrchestrator:
         self.proposer_llm = self.llm.with_structured_output(ProposerOutput)
         self.judge_llm = self.llm.with_structured_output(JudgeOutput)
 
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name=embedding_model,
-            model_kwargs={"device": "cpu"},
-        )
-        docs = [Document(page_content=g) for g in NASM_GUIDELINES]
-        self.vectorstore = FAISS.from_documents(docs, self.embeddings)
+        self.vectorstore, self.embeddings = self._init_vectorstore(embedding_model)
         self.retriever = self.vectorstore.as_retriever(search_kwargs={"k": 3})
 
         self._graph = self._build_graph()
+
+    # ------------------------------------------------------------------
+    # FAISS vectorstore initialisation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _init_vectorstore(
+        hf_model: str,
+    ) -> tuple[FAISS, object]:
+        """Load the persisted NASM FAISS index from ``vector_store/``.
+
+        Priority order:
+          1. ``vector_store/`` + OllamaEmbeddings (matches ``ingest_nasm.py``)
+          2. ``vector_store/`` + HuggingFaceEmbeddings (alternative ingest)
+          3. Hardcoded ``NASM_GUIDELINES`` fallback (9 entries)
+        """
+        vs_dir = _VECTOR_STORE_DIR
+
+        if vs_dir.is_dir() and (vs_dir / "index.faiss").is_file():
+            # Attempt 1: OllamaEmbeddings (nomic-embed-text) — matches ingest_nasm.py
+            try:
+                from langchain_ollama import OllamaEmbeddings
+                embeddings = OllamaEmbeddings(model="nomic-embed-text")
+                vs = FAISS.load_local(
+                    str(vs_dir), embeddings,
+                    allow_dangerous_deserialization=True,
+                )
+                agent_log(
+                    "RAG", GREEN,
+                    f"Loaded NASM FAISS index from {vs_dir} "
+                    f"({vs.index.ntotal} vectors, OllamaEmbeddings)",
+                )
+                return vs, embeddings
+            except Exception as exc:
+                logger.info("OllamaEmbeddings FAISS load failed: %s", exc)
+
+            # Attempt 2: HuggingFaceEmbeddings
+            try:
+                embeddings = HuggingFaceEmbeddings(
+                    model_name=hf_model,
+                    model_kwargs={"device": "cpu"},
+                )
+                vs = FAISS.load_local(
+                    str(vs_dir), embeddings,
+                    allow_dangerous_deserialization=True,
+                )
+                agent_log(
+                    "RAG", GREEN,
+                    f"Loaded NASM FAISS index from {vs_dir} "
+                    f"({vs.index.ntotal} vectors, HuggingFaceEmbeddings)",
+                )
+                return vs, embeddings
+            except Exception as exc:
+                logger.warning(
+                    "HuggingFace FAISS load also failed: %s — "
+                    "falling back to hardcoded guidelines.", exc,
+                )
+
+        # Fallback: build from hardcoded NASM_GUIDELINES
+        agent_log(
+            "RAG", YELLOW,
+            "vector_store/ not found or unreadable — "
+            "using hardcoded NASM guidelines (9 entries).",
+        )
+        embeddings = HuggingFaceEmbeddings(
+            model_name=hf_model,
+            model_kwargs={"device": "cpu"},
+        )
+        docs = [Document(page_content=g) for g in NASM_GUIDELINES]
+        return FAISS.from_documents(docs, embeddings), embeddings
 
     # ------------------------------------------------------------------
     # Public API

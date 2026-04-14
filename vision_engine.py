@@ -18,14 +18,21 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import ssl
+import statistics
 import time
 import urllib.request
+import warnings
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum, auto
 from pathlib import Path
 from typing import Optional
+
+os.environ["OPENCV_LOG_LEVEL"] = "FATAL"
+os.environ["OPENCV_VIDEOIO_DEBUG"] = "0"
+warnings.filterwarnings("ignore", category=UserWarning)
 
 import certifi
 import cv2
@@ -94,44 +101,110 @@ JOINT_TRIPLETS: dict[str, tuple[int, int, int]] = {
 EXERCISE_REP_CONFIG: dict[str, dict] = {
     "bicep_curl": {
         "primary_angles": ["left_elbow", "right_elbow"],
-        "contracted": 70.0,
+        "contracted": 85.0,
         "extended": 110.0,
     },
     "squat": {
         "primary_angles": ["left_knee", "right_knee"],
-        "contracted": 100.0,
-        "extended": 160.0,
+        "contracted": 120.0,
+        "extended": 145.0,
     },
     "pushup": {
         "primary_angles": ["left_elbow", "right_elbow"],
-        "contracted": 90.0,
-        "extended": 150.0,
+        "contracted": 110.0,
+        "extended": 145.0,
     },
     "deadlift": {
         "primary_angles": ["left_hip", "right_hip"],
-        "contracted": 100.0,
-        "extended": 160.0,
+        "contracted": 125.0,
+        "extended": 150.0,
     },
     "shoulder_press": {
         "primary_angles": ["left_elbow", "right_elbow"],
-        "contracted": 90.0,
-        "extended": 155.0,
+        "contracted": 110.0,
+        "extended": 145.0,
     },
     "lunge": {
         "primary_angles": ["left_knee", "right_knee"],
-        "contracted": 100.0,
-        "extended": 155.0,
+        "contracted": 120.0,
+        "extended": 148.0,
+    },
+    "lateral_raise": {
+        "primary_angles": ["left_shoulder", "right_shoulder"],
+        "contracted": 50.0,
+        "extended": 38.0,
+        "inverted": True,
+    },
+    "front_raise": {
+        "primary_angles": ["left_shoulder", "right_shoulder"],
+        "contracted": 50.0,
+        "extended": 38.0,
+        "inverted": True,
+    },
+    "tricep_dip": {
+        "primary_angles": ["left_elbow", "right_elbow"],
+        "contracted": 105.0,
+        "extended": 140.0,
+    },
+    "bent_over_row": {
+        "primary_angles": ["left_elbow", "right_elbow"],
+        "contracted": 95.0,
+        "extended": 130.0,
+    },
+    "leg_press": {
+        "primary_angles": ["left_knee", "right_knee"],
+        "contracted": 115.0,
+        "extended": 148.0,
+    },
+    "russian_twist": {
+        "primary_angles": ["left_hip", "right_hip"],
+        "contracted": 75.0,
+        "extended": 88.0,
     },
 }
 
 DEFAULT_REP_CONFIG: dict = {
     "primary_angles": ["left_elbow", "right_elbow"],
-    "contracted": 70.0,
-    "extended": 130.0,
+    "contracted": 90.0,
+    "extended": 125.0,
 }
 
-FATIGUE_MULTIPLIER: float = 1.3
-REP_HISTORY_SIZE: int = 8
+# ---------------------------------------------------------------------------
+# Classifier label → rep config key translation
+# ---------------------------------------------------------------------------
+# The PyTorch classifier outputs labels derived from the dataset folder names
+# (e.g. "push-up", "barbell biceps curl").  EXERCISE_REP_CONFIG uses short
+# keys (e.g. "pushup", "bicep_curl").  This dict bridges the gap so the rep
+# state machine always finds the right angle thresholds.
+
+CLASSIFIER_LABEL_TO_REP_KEY: dict[str, str] = {
+    "barbell biceps curl": "bicep_curl",
+    "hammer curl": "bicep_curl",
+    "bench press": "pushup",
+    "decline bench press": "pushup",
+    "incline bench press": "pushup",
+    "chest fly machine": "pushup",
+    "push-up": "pushup",
+    "deadlift": "deadlift",
+    "romanian deadlift": "deadlift",
+    "squat": "squat",
+    "hip thrust": "deadlift",
+    "lateral raise": "lateral_raise",
+    "shoulder press": "shoulder_press",
+    "lat pulldown": "bent_over_row",
+    "t bar row": "bent_over_row",
+    "pull Up": "bent_over_row",
+    "tricep dips": "tricep_dip",
+    "tricep Pushdown": "tricep_dip",
+    "leg extension": "leg_press",
+    "leg raises": "russian_twist",
+    "russian twist": "russian_twist",
+    "plank": "pushup",
+}
+
+FATIGUE_MULTIPLIER: float = 1.5
+FATIGUE_WARMUP_REPS: int = 5
+REP_HISTORY_SIZE: int = 20
 
 # ---------------------------------------------------------------------------
 # MediaPipe model download
@@ -228,6 +301,7 @@ class RepState:
     neuromuscular_fatigue: bool = False
     detected_exercise: str = "unknown"
     exercise_confidence: float = 0.0
+    baseline_avg_duration: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +353,16 @@ def _draw_pose_skeleton(frame_bgr: np.ndarray, landmarks_norm: list) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _print_exercise_lock(exercise: str, *, auto: bool = False) -> None:
+    """Bold terminal banner when the active exercise changes."""
+    tag = "AUTO-DETECT" if auto else "LOCKED"
+    print(
+        f"\n\033[1m\033[96m🎯 [{tag}]: "
+        f"{exercise.upper().replace('_', ' ')}\033[0m\n",
+        flush=True,
+    )
+
+
 class PoseTracker:
     """Real-time pose tracking with PyTorch exercise classification and
     generic angle-based rep counting."""
@@ -320,6 +404,10 @@ class PoseTracker:
         # ── Rep tracking state ────────────────────────────────────────
         self.rep_state = RepState()
         self.latest_telemetry: Optional[dict] = None
+        self._frame_counter: int = 0
+        self._pred_buffer: deque[str] = deque(maxlen=15)
+        self._last_locked_exercise: str = ""
+        self._active_rep_key: str = ""
 
     # -- classifier loading ------------------------------------------------
 
@@ -375,12 +463,34 @@ class PoseTracker:
     # -- public API --------------------------------------------------------
 
     def process_frame(
-        self, frame: np.ndarray,
+        self,
+        frame: np.ndarray,
+        *,
+        tracking_active: bool = True,
+        locked_exercise: str = "",
+        classify_stride: int = 5,
+        allowed_labels: Optional[set[str]] = None,
     ) -> tuple[np.ndarray, Optional[dict]]:
-        """Run pose estimation + exercise classification on a BGR frame.
+        """Run pose estimation on a BGR frame, optionally with full tracking.
+
+        Parameters
+        ----------
+        tracking_active:
+            ``False`` = setup mode — skeleton drawn, but classifier / rep
+            counter / fatigue evaluator are all skipped.
+        locked_exercise:
+            When non-empty, the rep counter uses this ``EXERCISE_REP_CONFIG``
+            key exclusively and the PyTorch classifier is skipped entirely.
+            This prevents random exercise guesses during an active set.
+        classify_stride:
+            When ``locked_exercise`` is empty, the PyTorch classifier only
+            runs every *N*-th frame.  Intermediate frames reuse the last
+            prediction, keeping the WebRTC callback fast (~5 ms vs ~25 ms).
 
         Returns ``(annotated_bgr_frame, telemetry_dict_or_None)``.
         """
+        self._frame_counter += 1
+
         frame = cv2.flip(frame, 1)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         rgb = np.ascontiguousarray(rgb)
@@ -403,11 +513,31 @@ class PoseTracker:
         world = result.pose_world_landmarks[0]
         angles = self._compute_angles(world)
 
-        exercise, confidence = self._classify_exercise(world)
-        self.rep_state.detected_exercise = exercise
-        self.rep_state.exercise_confidence = confidence
+        if tracking_active:
+            if locked_exercise:
+                if locked_exercise != self._last_locked_exercise:
+                    self._last_locked_exercise = locked_exercise
+                    self._pred_buffer.clear()
+                    _print_exercise_lock(locked_exercise)
+                self.rep_state.detected_exercise = locked_exercise
+                self.rep_state.exercise_confidence = 1.0
+            elif self._frame_counter % classify_stride == 0:
+                exercise, confidence = self._classify_exercise(
+                    world, allowed_labels=allowed_labels,
+                )
+                self._pred_buffer.append(exercise)
+                try:
+                    smoothed = statistics.mode(self._pred_buffer)
+                except statistics.StatisticsError:
+                    smoothed = exercise
+                if smoothed != self.rep_state.detected_exercise:
+                    _print_exercise_lock(smoothed, auto=True)
+                self.rep_state.detected_exercise = smoothed
+                self.rep_state.exercise_confidence = confidence
 
-        self._update_rep_state_machine(angles, exercise)
+            self._update_rep_state_machine(
+                angles, self.rep_state.detected_exercise,
+            )
 
         telemetry = self._build_telemetry(angles)
         self.latest_telemetry = telemetry
@@ -417,6 +547,10 @@ class PoseTracker:
         """Reset rep counter, fatigue state, and telemetry for a new session."""
         self.rep_state = RepState()
         self.latest_telemetry = None
+        self._frame_counter = 0
+        self._pred_buffer.clear()
+        self._last_locked_exercise = ""
+        self._active_rep_key = ""
 
     def close(self) -> None:
         self._landmarker.close()
@@ -425,14 +559,19 @@ class PoseTracker:
 
     def _classify_exercise(
         self, world_landmarks: list,
+        *, allowed_labels: Optional[set[str]] = None,
     ) -> tuple[str, float]:
         """Run the PyTorch MLP on the 99 world-landmark features.
+
+        When *allowed_labels* is provided, logits for classes outside the set
+        are masked to ``-inf`` before softmax so the prediction is constrained
+        to the user's selected muscle group.
 
         Returns ``(exercise_name, confidence)`` or ``("unknown", 0.0)`` when
         the classifier is unavailable.
         """
         if self._classifier is None:
-            return "bicep_curl", 0.0
+            return "unknown", 0.0
 
         features = []
         for lm in world_landmarks:
@@ -453,6 +592,10 @@ class PoseTracker:
 
         with torch.no_grad():
             logits = self._classifier(tensor)
+            if allowed_labels:
+                for i in range(logits.shape[1]):
+                    if self._idx_to_label.get(i, "") not in allowed_labels:
+                        logits[0, i] = float("-inf")
             probs = torch.softmax(logits, dim=-1)
             conf, idx = probs.max(dim=-1)
 
@@ -481,46 +624,66 @@ class PoseTracker:
     ) -> None:
         """Generic two-phase rep counter.
 
-        Selects the primary joint angles and thresholds from
-        ``EXERCISE_REP_CONFIG`` based on the classified exercise, then runs
-        a simple EXTENDED ↔ CONTRACTED state machine.
+        Uses ``min()`` (standard) or ``max()`` (inverted) of the primary
+        joint angles rather than the mean.  This prevents one poorly-tracked
+        side from dragging the value into the dead-zone between thresholds
+        where the state machine would stall.
 
         A full rep = EXTENDED → CONTRACTED → EXTENDED.
         """
-        config = EXERCISE_REP_CONFIG.get(exercise, DEFAULT_REP_CONFIG)
+        rep_key = CLASSIFIER_LABEL_TO_REP_KEY.get(exercise, exercise)
+        config = EXERCISE_REP_CONFIG.get(rep_key, DEFAULT_REP_CONFIG)
         primary_keys = config["primary_angles"]
         contracted_thresh = config["contracted"]
         extended_thresh = config["extended"]
+        inverted = config.get("inverted", False)
 
-        avg_angle = float(np.mean(
-            [angles.get(k, 180.0) for k in primary_keys]
-        ))
+        raw_angles = [angles.get(k, 180.0) for k in primary_keys]
+
+        if inverted:
+            driving_angle = float(max(raw_angles))
+        else:
+            driving_angle = float(min(raw_angles))
+
+        is_extended = (
+            (driving_angle <= extended_thresh) if inverted
+            else (driving_angle >= extended_thresh)
+        )
+        is_contracted = (
+            (driving_angle >= contracted_thresh) if inverted
+            else (driving_angle <= contracted_thresh)
+        )
 
         now = time.monotonic()
         state = self.rep_state
 
+        if rep_key != getattr(self, "_active_rep_key", ""):
+            self._active_rep_key = rep_key
+            state.phase = Phase.UNKNOWN
+
+        if self._frame_counter % 90 == 0:
+            print(
+                f"[STATE] exercise={exercise}  rep_key={rep_key}  "
+                f"angle={driving_angle:.1f}  "
+                f"thresh=[{contracted_thresh}, {extended_thresh}]  "
+                f"phase={state.phase.name}  reps={state.rep_count}",
+                flush=True,
+            )
+
         if state.phase == Phase.UNKNOWN:
-            if avg_angle >= extended_thresh:
+            if is_extended:
                 state.phase = Phase.EXTENDED
-            elif avg_angle <= contracted_thresh:
+            elif is_contracted:
                 state.phase = Phase.CONTRACTED
             state.phase_start_time = now
             return
 
-        # EXTENDED → CONTRACTED (concentric)
-        if (
-            state.phase == Phase.EXTENDED
-            and avg_angle <= contracted_thresh
-        ):
+        if state.phase == Phase.EXTENDED and is_contracted:
             state.concentric_duration = now - state.phase_start_time
             state.phase = Phase.CONTRACTED
             state.phase_start_time = now
 
-        # CONTRACTED → EXTENDED (eccentric → 1 full rep)
-        elif (
-            state.phase == Phase.CONTRACTED
-            and avg_angle >= extended_thresh
-        ):
+        elif state.phase == Phase.CONTRACTED and is_extended:
             state.eccentric_duration = now - state.phase_start_time
             state.phase = Phase.EXTENDED
             state.phase_start_time = now
@@ -535,39 +698,69 @@ class PoseTracker:
 
     def _log_rep(self, angles: dict[str, float]) -> None:
         state = self.rep_state
-        config = EXERCISE_REP_CONFIG.get(
-            state.detected_exercise, DEFAULT_REP_CONFIG,
-        )
-        primary_keys = config["primary_angles"]
-        primary_avg = round(float(np.mean(
-            [angles.get(k, 0.0) for k in primary_keys]
-        )), 1)
 
         payload = {
             "exercise": state.detected_exercise,
             "exercise_confidence": state.exercise_confidence,
             "rep": state.rep_count,
-            "rep_time": round(state.current_rep_duration, 3),
+            "angles_deg": {k: round(v, 1) for k, v in angles.items()},
+            "rep_time_sec": round(state.current_rep_duration, 3),
             "concentric_sec": round(state.concentric_duration, 3),
             "eccentric_sec": round(state.eccentric_duration, 3),
-            "avg_rep_time": round(
+            "avg_rep_time_sec": round(
                 float(np.mean(state.rep_durations)), 3,
             ),
-            "fatigue": state.neuromuscular_fatigue,
-            "primary_angle_avg": primary_avg,
+            "baseline_avg_sec": round(state.baseline_avg_duration, 3),
+            "fatigue_threshold_sec": round(
+                FATIGUE_MULTIPLIER * state.baseline_avg_duration, 3,
+            ) if state.baseline_avg_duration > 0 else None,
+            "neuromuscular_fatigue": state.neuromuscular_fatigue,
         }
+
+        b, r = "\033[1m", "\033[0m"
+        warmup = state.rep_count <= FATIGUE_WARMUP_REPS
+        tag = " (warmup)" if warmup else ""
+        print(f"\n{b}── REP {state.rep_count}{tag} ──{r}", flush=True)
         print(json.dumps(payload, indent=2), flush=True)
+        if warmup and state.rep_count == FATIGUE_WARMUP_REPS:
+            print(
+                f"\033[92m{b}✓ Warmup complete — baseline locked at "
+                f"{state.baseline_avg_duration:.3f}s  "
+                f"(fatigue threshold: "
+                f"{FATIGUE_MULTIPLIER * state.baseline_avg_duration:.3f}s){r}",
+                flush=True,
+            )
         if state.neuromuscular_fatigue:
-            print(">>> neuromuscular_fatigue: True", flush=True)
+            print(
+                f"\033[91m{b}>>> NEUROMUSCULAR FATIGUE DETECTED{r}",
+                flush=True,
+            )
 
     def _evaluate_fatigue(self) -> None:
+        """Neuromuscular fatigue detection with a warmup grace period.
+
+        Reps 1-``FATIGUE_WARMUP_REPS`` are *never* flagged.  After the warmup
+        the average duration of those first reps is locked as the baseline.
+        Subsequent reps are flagged when they exceed
+        ``FATIGUE_MULTIPLIER × baseline`` (50 % slower than the warmup pace).
+        """
         state = self.rep_state
-        if len(state.rep_durations) < 2:
+
+        if state.rep_count <= FATIGUE_WARMUP_REPS:
+            state.neuromuscular_fatigue = False
+            if state.rep_count == FATIGUE_WARMUP_REPS:
+                state.baseline_avg_duration = float(np.mean(
+                    list(state.rep_durations)[:FATIGUE_WARMUP_REPS]
+                ))
+            return
+
+        if state.baseline_avg_duration <= 0:
             state.neuromuscular_fatigue = False
             return
-        avg_duration = float(np.mean(state.rep_durations))
+
         state.neuromuscular_fatigue = (
-            state.current_rep_duration > FATIGUE_MULTIPLIER * avg_duration
+            state.current_rep_duration
+            > FATIGUE_MULTIPLIER * state.baseline_avg_duration
         )
 
     def _build_telemetry(self, angles: dict[str, float]) -> dict:
@@ -575,6 +768,12 @@ class PoseTracker:
         avg_dur = (
             round(float(np.mean(state.rep_durations)), 3)
             if state.rep_durations
+            else 0.0
+        )
+        baseline = round(state.baseline_avg_duration, 3)
+        threshold = (
+            round(FATIGUE_MULTIPLIER * state.baseline_avg_duration, 3)
+            if state.baseline_avg_duration > 0
             else 0.0
         )
         return {
@@ -587,5 +786,7 @@ class PoseTracker:
             "eccentric_sec": round(state.eccentric_duration, 3),
             "current_rep_sec": round(state.current_rep_duration, 3),
             "avg_rep_sec": avg_dur,
+            "baseline_avg_sec": baseline,
+            "fatigue_threshold_sec": threshold,
             "neuromuscular_fatigue": state.neuromuscular_fatigue,
         }
