@@ -408,6 +408,7 @@ class PoseTracker:
         self._pred_buffer: deque[str] = deque(maxlen=15)
         self._last_locked_exercise: str = ""
         self._active_rep_key: str = ""
+        self._last_world_landmarks: Optional[list] = None
 
     # -- classifier loading ------------------------------------------------
 
@@ -511,6 +512,7 @@ class PoseTracker:
             return frame, None
 
         world = result.pose_world_landmarks[0]
+        self._last_world_landmarks = world
         angles = self._compute_angles(world)
 
         if tracking_active:
@@ -601,6 +603,58 @@ class PoseTracker:
 
         label = self._idx_to_label.get(idx.item(), "unknown")
         return label, round(conf.item(), 3)
+
+    def classify_exercise_topk(
+        self,
+        world_landmarks: list,
+        *,
+        allowed_labels: Optional[set[str]] = None,
+        k: int = 3,
+    ) -> list[tuple[str, float]]:
+        """Return the top-*k* ``(label, confidence)`` pairs.
+
+        Uses the same feature extraction and optional logit masking as
+        ``_classify_exercise`` but calls ``torch.topk`` instead of argmax.
+        Returns an empty list when the classifier is unavailable.
+        """
+        if self._classifier is None or not _torch_available:
+            return []
+
+        features = []
+        for lm in world_landmarks:
+            features.extend([
+                float(lm.x or 0.0),
+                float(lm.y or 0.0),
+                float(lm.z or 0.0),
+            ])
+
+        feat_np = np.array(features, dtype=np.float32)
+
+        if self._norm_mean is not None and self._norm_std is not None:
+            feat_np = (feat_np - self._norm_mean) / self._norm_std
+
+        tensor = torch.tensor(feat_np, dtype=torch.float32).unsqueeze(0).to(
+            self._device,
+        )
+
+        with torch.no_grad():
+            logits = self._classifier(tensor)
+            if allowed_labels:
+                for i in range(logits.shape[1]):
+                    if self._idx_to_label.get(i, "") not in allowed_labels:
+                        logits[0, i] = float("-inf")
+            probs = torch.softmax(logits, dim=-1)
+            n_valid = min(k, probs.shape[1])
+            top_confs, top_idxs = torch.topk(probs, n_valid, dim=-1)
+
+        results: list[tuple[str, float]] = []
+        for c, i in zip(
+            top_confs.squeeze(0).tolist(),
+            top_idxs.squeeze(0).tolist(),
+        ):
+            label = self._idx_to_label.get(i, "unknown")
+            results.append((label, round(c, 3)))
+        return results
 
     # -- internals ---------------------------------------------------------
 

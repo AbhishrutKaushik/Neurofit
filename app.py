@@ -22,6 +22,7 @@ import queue
 import socket
 import threading
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Optional
 
@@ -235,6 +236,21 @@ if "target_exercise" not in st.session_state:
 if "fatigue_stopped" not in st.session_state:
     st.session_state.fatigue_stopped = False
 
+if "workout_phase" not in st.session_state:
+    st.session_state.workout_phase = "SETUP"
+
+if "autodetect_start_time" not in st.session_state:
+    st.session_state.autodetect_start_time = 0.0
+
+if "autodetect_predictions" not in st.session_state:
+    st.session_state.autodetect_predictions = []
+
+if "confirm_candidates" not in st.session_state:
+    st.session_state.confirm_candidates = []
+
+if "confirm_index" not in st.session_state:
+    st.session_state.confirm_index = 0
+
 tracker: PoseTracker = st.session_state.tracker
 tts: TTSEngine = st.session_state.tts
 
@@ -268,6 +284,9 @@ class _VideoState:
         self.locked_exercise: str = ""
         self.fatigue_stopped: bool = False
         self.allowed_labels: set = set()
+        # Auto-detect confirmation flow
+        self.workout_phase: str = "SETUP"  # SETUP | AUTO_DETECTING | CONFIRMING | WORKOUT_ACTIVE
+        self.top_predictions: list[tuple[str, float]] = []
         # IP webcam: background thread writes JPEG bytes; fragment just reads
         self._ip_jpg_bytes: Optional[bytes] = None
         # WebRTC zero-copy pipeline
@@ -280,11 +299,14 @@ if "_vstate" not in st.session_state:
     st.session_state._vstate = _VideoState()
 _vs: _VideoState = st.session_state._vstate
 _vs.is_workout_active = st.session_state.get("is_workout_active", False)
+_vs.workout_phase = st.session_state.get("workout_phase", "SETUP")
 
 if _vs.fatigue_stopped and st.session_state.get("is_workout_active", False):
     st.session_state.is_workout_active = False
     st.session_state.fatigue_stopped = True
     _vs.is_workout_active = False
+    st.session_state.workout_phase = "SETUP"
+    _vs.workout_phase = "SETUP"
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -600,6 +622,27 @@ def _draw_setup_overlay(frame: np.ndarray) -> None:
         )
 
 
+def _draw_autodetect_overlay(frame: np.ndarray) -> None:
+    """Burn a centred 'ANALYZING' banner onto the video frame."""
+    h, w = frame.shape[:2]
+    overlay = frame.copy()
+    band_h = 74
+    y1 = (h - band_h) // 2
+    cv2.rectangle(overlay, (0, y1), (w, y1 + band_h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, dst=frame)
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    for text, scale, thick, dy, color in (
+        ("ANALYZING MOVEMENT...", 0.85, 2, 30, (0, 200, 255)),
+        ("Keep moving — detecting your exercise", 0.50, 1, 58, (200, 200, 200)),
+    ):
+        (tw, _), _ = cv2.getTextSize(text, font, scale, thick)
+        cv2.putText(
+            frame, text, ((w - tw) // 2, y1 + dy),
+            font, scale, color, thick, cv2.LINE_AA,
+        )
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Shared frame-processing logic (used by BOTH WebRTC and IP Webcam)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -609,14 +652,18 @@ def _process_and_annotate(img: np.ndarray) -> np.ndarray:
     """Run MediaPipe on a BGR frame and return the annotated result.
 
     Execution modes (driven by ``_vs`` flags):
-      • **Setup** (``is_workout_active=False``) — skeleton drawn, classifier
-        and rep counter skipped, "SETUP MODE" overlay burned onto frame.
-      • **Tracking** (``is_workout_active=True``) — full pipeline with
-        locked exercise, frame-skipped classifier, rep counting, fatigue.
-        On fatigue the set is **auto-stopped** and ``fatigue_stopped`` set.
+      • **Setup** (``is_workout_active=False``, phase ``SETUP``) — skeleton
+        drawn, classifier and rep counter skipped, overlay shown.
+      • **Auto-detecting** (phase ``AUTO_DETECTING``) — skeleton + classifier
+        top-k running, but rep counter and fatigue skipped.
+      • **Confirming** (phase ``CONFIRMING``) — skeleton only, no classifier/
+        rep/fatigue.
+      • **Tracking** (``is_workout_active=True``, phase ``WORKOUT_ACTIVE``) —
+        full pipeline with locked exercise, rep counting, fatigue.
     """
     h, w = img.shape[:2]
-    active = _vs.is_workout_active
+    phase = _vs.workout_phase
+    active = _vs.is_workout_active and phase == "WORKOUT_ACTIVE"
     locked = _vs.locked_exercise if active else ""
 
     if w > _MAX_INFERENCE_WIDTH:
@@ -629,6 +676,46 @@ def _process_and_annotate(img: np.ndarray) -> np.ndarray:
     else:
         small = img
 
+    # --- AUTO_DETECTING: pose + top-k classifier, no rep counting ---------
+    if phase == "AUTO_DETECTING":
+        annotated_small, telemetry = tracker.process_frame(
+            small, tracking_active=False, locked_exercise="",
+        )
+        if telemetry is not None and hasattr(tracker, 'classify_exercise_topk'):
+            # process_frame already ran detect_for_video and stashed
+            # world landmarks in tracker._last_world_landmarks.
+            world = tracker._last_world_landmarks
+            if world is not None:
+                allowed = _vs.allowed_labels or None
+                _vs.top_predictions = tracker.classify_exercise_topk(
+                    world, allowed_labels=allowed, k=3,
+                )
+        if annotated_small.shape[:2] != (h, w):
+            annotated = cv2.resize(
+                annotated_small, (w, h), interpolation=cv2.INTER_LINEAR,
+            )
+        else:
+            annotated = annotated_small
+        # Draw an "ANALYZING" overlay instead of setup
+        _draw_autodetect_overlay(annotated)
+        _vs.last_bgr = annotated
+        return annotated
+
+    # --- CONFIRMING: skeleton only, no classifier/rep/fatigue -------------
+    if phase == "CONFIRMING":
+        annotated_small, _ = tracker.process_frame(
+            small, tracking_active=False, locked_exercise="",
+        )
+        if annotated_small.shape[:2] != (h, w):
+            annotated = cv2.resize(
+                annotated_small, (w, h), interpolation=cv2.INTER_LINEAR,
+            )
+        else:
+            annotated = annotated_small
+        _vs.last_bgr = annotated
+        return annotated
+
+    # --- SETUP or WORKOUT_ACTIVE ------------------------------------------
     allowed = _vs.allowed_labels if (active and not locked) else None
     annotated_small, telemetry = tracker.process_frame(
         small, tracking_active=active, locked_exercise=locked,
@@ -662,9 +749,16 @@ def _process_and_annotate(img: np.ndarray) -> np.ndarray:
                 pass
             _rep_q.put((rep_count, telemetry, annotated.copy()))
 
-        if fatigue:
+        if fatigue and not _vs.fatigue_stopped:
             _vs.is_workout_active = False
             _vs.fatigue_stopped = True
+            _vs.workout_phase = "SETUP"
+            tts.flush()
+            tts.speak(
+                "Critical fatigue detected. Form breakdown imminent. "
+                "Set automatically stopped to prevent injury. "
+                "Please rack the weight."
+            )
 
     return annotated
 
@@ -994,6 +1088,8 @@ with tab_workout:
                 _vs.fatigue_stopped = False
                 st.session_state.is_workout_active = False
                 _vs.is_workout_active = False
+                st.session_state.workout_phase = "SETUP"
+                _vs.workout_phase = "SETUP"
                 _vs.fatigue_active = False
                 _vs.locked_exercise = ""
                 _vs.allowed_labels = set()
@@ -1009,29 +1105,67 @@ with tab_workout:
                     pass
                 st.session_state.fatigue_toast_shown = False
                 st.rerun()
-        elif not _workout_active:
+        elif not _workout_active and st.session_state.get("workout_phase", "SETUP") == "SETUP":
             if st.button(
                 "\u25b6\ufe0f START SET",
                 type="primary",
                 width="stretch",
             ):
                 if exercise_choice == _AUTO_DETECT:
-                    _key = ""
+                    # Enter 10-second auto-detect analysis phase
                     _vs.allowed_labels = _MUSCLE_GROUP_CLASSIFIER_LABELS.get(muscle, set())
+                    _vs.locked_exercise = ""
+                    _vs.is_workout_active = False
+                    st.session_state.is_workout_active = False
+                    st.session_state.workout_phase = "AUTO_DETECTING"
+                    _vs.workout_phase = "AUTO_DETECTING"
+                    st.session_state.autodetect_start_time = time.time()
+                    st.session_state.autodetect_predictions = []
+                    st.session_state.confirm_candidates = []
+                    st.session_state.confirm_index = 0
+                    tracker.reset()
+                    _vs.prev_rep_count = 0
+                    _vs.detected_exercise = "unknown"
+                    _vs.exercise_confidence = 0.0
+                    _vs.fatigue_active = False
+                    _vs.fatigue_stopped = False
+                    st.session_state.fatigue_stopped = False
+                    st.session_state.fatigue_toast_shown = False
                 else:
+                    # Specific exercise — go directly to WORKOUT_ACTIVE
                     _key = _EXERCISE_KEY_MAP.get(exercise_choice, "")
                     _vs.allowed_labels = set()
-                st.session_state.is_workout_active = True
-                _vs.is_workout_active = True
-                _vs.locked_exercise = _key
-                tracker.reset()
-                _vs.prev_rep_count = 0
-                _vs.detected_exercise = _key or "unknown"
-                _vs.exercise_confidence = 0.0
-                _vs.fatigue_active = False
-                _vs.fatigue_stopped = False
-                st.session_state.fatigue_stopped = False
-                st.session_state.fatigue_toast_shown = False
+                    st.session_state.is_workout_active = True
+                    _vs.is_workout_active = True
+                    _vs.locked_exercise = _key
+                    st.session_state.workout_phase = "WORKOUT_ACTIVE"
+                    _vs.workout_phase = "WORKOUT_ACTIVE"
+                    tracker.reset()
+                    _vs.prev_rep_count = 0
+                    _vs.detected_exercise = _key or "unknown"
+                    _vs.exercise_confidence = 0.0
+                    _vs.fatigue_active = False
+                    _vs.fatigue_stopped = False
+                    st.session_state.fatigue_stopped = False
+                    st.session_state.fatigue_toast_shown = False
+                st.rerun()
+        elif st.session_state.get("workout_phase") in ("AUTO_DETECTING", "CONFIRMING"):
+            # During auto-detect / confirmation, show a Cancel button
+            if st.button(
+                "❌ Cancel Auto-Detect",
+                type="secondary",
+                width="stretch",
+            ):
+                st.session_state.workout_phase = "SETUP"
+                _vs.workout_phase = "SETUP"
+                st.session_state.is_workout_active = False
+                _vs.is_workout_active = False
+                _vs.locked_exercise = ""
+                _vs.allowed_labels = set()
+                _vs.top_predictions = []
+                st.session_state.autodetect_predictions = []
+                st.session_state.confirm_candidates = []
+                st.session_state.confirm_index = 0
                 st.rerun()
         else:
             if st.button(
@@ -1041,6 +1175,8 @@ with tab_workout:
             ):
                 st.session_state.is_workout_active = False
                 _vs.is_workout_active = False
+                st.session_state.workout_phase = "SETUP"
+                _vs.workout_phase = "SETUP"
                 _vs.fatigue_active = False
                 _vs.locked_exercise = ""
                 _vs.allowed_labels = set()
@@ -1065,6 +1201,25 @@ with tab_workout:
         def _exercise_header() -> None:
             if _vs.fatigue_stopped:
                 return  # fatigue banner takes over
+            phase = st.session_state.get("workout_phase", "SETUP")
+            if phase == "AUTO_DETECTING":
+                elapsed = time.time() - st.session_state.get("autodetect_start_time", time.time())
+                remaining = max(0, 10 - elapsed)
+                st.markdown(
+                    '<div class="exercise-header">'
+                    f"🔍 Analyzing movement&hellip; {remaining:.0f}s remaining"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+                return
+            if phase == "CONFIRMING":
+                st.markdown(
+                    '<div class="exercise-header">'
+                    "🤔 Confirm your exercise below"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+                return
             if not _vs.is_workout_active:
                 st.markdown(
                     '<div class="exercise-header">'
@@ -1089,6 +1244,148 @@ with tab_workout:
             )
 
         _exercise_header()
+
+        # ── Auto-detect + Confirmation (single polling fragment) ─────────
+        # CRITICAL: Both phases live in ONE fragment with run_every so that
+        # state transitions (AUTO_DETECTING → CONFIRMING) are picked up
+        # automatically.  A separate non-polling fragment would never
+        # re-render because st.rerun() inside a run_every fragment only
+        # reruns that fragment, not the full page.
+        @st.fragment(run_every="0.5s")
+        def _autodetect_and_confirm() -> None:
+            phase = st.session_state.get("workout_phase", "SETUP")
+
+            # ── AUTO_DETECTING: countdown + accumulate predictions ────────
+            if phase == "AUTO_DETECTING":
+                elapsed = time.time() - st.session_state.get(
+                    "autodetect_start_time", time.time(),
+                )
+                # Accumulate top-k predictions from the vision engine
+                top = _vs.top_predictions
+                if top:
+                    st.session_state.autodetect_predictions.append(list(top))
+
+                if elapsed < 10.0:
+                    remaining = max(0, 10 - elapsed)
+                    st.info(
+                        f"🔍 **Analyzing movement…** {remaining:.0f}s remaining.  "
+                        "Keep performing your exercise."
+                    )
+                    if top:
+                        best_label = top[0][0].replace("_", " ").title()
+                        best_conf = top[0][1]
+                        st.caption(
+                            f"Current best guess: **{best_label}** "
+                            f"({best_conf:.0%})"
+                        )
+                    return
+
+                # 10 seconds elapsed — aggregate predictions
+                all_preds = st.session_state.autodetect_predictions
+                if not all_preds:
+                    st.session_state.workout_phase = "SETUP"
+                    _vs.workout_phase = "SETUP"
+                    st.warning(
+                        "Could not detect an exercise. Please select manually."
+                    )
+                    return
+
+                label_counter: Counter = Counter()
+                conf_sums: dict[str, float] = {}
+                conf_counts: dict[str, int] = {}
+                for frame_preds in all_preds:
+                    for rank, (lbl, cnf) in enumerate(frame_preds):
+                        weight = 3 - rank
+                        label_counter[lbl] += weight
+                        conf_sums[lbl] = conf_sums.get(lbl, 0.0) + cnf
+                        conf_counts[lbl] = conf_counts.get(lbl, 0) + 1
+
+                top3 = label_counter.most_common(3)
+                candidates = []
+                for lbl, _count in top3:
+                    avg_c = (
+                        conf_sums[lbl] / conf_counts[lbl]
+                        if conf_counts.get(lbl) else 0.0
+                    )
+                    candidates.append((lbl, round(avg_c, 3)))
+
+                st.session_state.confirm_candidates = candidates
+                st.session_state.confirm_index = 0
+                st.session_state.workout_phase = "CONFIRMING"
+                _vs.workout_phase = "CONFIRMING"
+                # Don't st.rerun() — the next run_every cycle will pick up
+                # CONFIRMING and render the buttons below.
+                return
+
+            # ── CONFIRMING: show prediction + Yes / No buttons ────────────
+            if phase == "CONFIRMING":
+                candidates = st.session_state.get("confirm_candidates", [])
+                idx = st.session_state.get("confirm_index", 0)
+
+                if not candidates or idx >= len(candidates):
+                    st.warning(
+                        "None of the detected exercises matched. "
+                        "Please select your exercise manually."
+                    )
+                    if st.button("🔙 Back to Setup", key="confirm_back"):
+                        st.session_state.workout_phase = "SETUP"
+                        _vs.workout_phase = "SETUP"
+                        _vs.locked_exercise = ""
+                        _vs.allowed_labels = set()
+                        _vs.top_predictions = []
+                        # No st.rerun() — run_every picks this up on next cycle
+                    return
+
+                label, conf = candidates[idx]
+                display_name = label.replace("_", " ").title()
+
+                if idx == 0:
+                    st.success(
+                        f"🎯 We detected you are doing **{display_name}** "
+                        f"({conf:.0%} confidence). Is this correct?"
+                    )
+                else:
+                    st.info(
+                        f"Okay, are you doing **{display_name}** "
+                        f"({conf:.0%} confidence)?"
+                    )
+
+                btn_yes, btn_no = st.columns(2)
+                with btn_yes:
+                    if st.button(
+                        "✅ Yes, let's go!",
+                        key=f"confirm_yes_{idx}",
+                        type="primary",
+                    ):
+                        from vision_engine import CLASSIFIER_LABEL_TO_REP_KEY
+                        _vs.locked_exercise = label
+                        _vs.detected_exercise = label
+                        _vs.exercise_confidence = conf
+                        _vs.is_workout_active = True
+                        _vs.workout_phase = "WORKOUT_ACTIVE"
+                        _vs.allowed_labels = set()
+                        _vs.top_predictions = []
+                        st.session_state.is_workout_active = True
+                        st.session_state.workout_phase = "WORKOUT_ACTIVE"
+                        tracker.reset()
+                        _vs.prev_rep_count = 0
+                        _vs.fatigue_active = False
+                        # No st.rerun() — run_every picks this up;
+                        # background thread starts tracking immediately
+                        # via _vs flags.
+                with btn_no:
+                    remaining = len(candidates) - idx - 1
+                    no_label = (
+                        "❌ No, it's something else"
+                        if remaining > 0
+                        else "❌ None of these"
+                    )
+                    if st.button(no_label, key=f"confirm_no_{idx}"):
+                        st.session_state.confirm_index = idx + 1
+                        # No st.rerun() — run_every picks this up on next
+                        # cycle and renders the next candidate.
+
+        _autodetect_and_confirm()
 
         # ── Fatigue alert overlay (cinematic — persistent until ack) ─────
         @st.fragment(run_every="0.5s")
@@ -1183,6 +1480,8 @@ with tab_workout:
                 st.session_state._ip_streaming = False
                 st.session_state.is_workout_active = False
                 _vs.is_workout_active = False
+                st.session_state.workout_phase = "SETUP"
+                _vs.workout_phase = "SETUP"
                 _vs.locked_exercise = ""
                 _vs.allowed_labels = set()
                 _vs.fatigue_active = False
@@ -1316,6 +1615,8 @@ with tab_workout:
                 tracker.reset()
                 st.session_state.is_workout_active = False
                 _vs.is_workout_active = False
+                st.session_state.workout_phase = "SETUP"
+                _vs.workout_phase = "SETUP"
                 _vs.locked_exercise = ""
                 _vs.allowed_labels = set()
                 _vs.prev_rep_count = 0
