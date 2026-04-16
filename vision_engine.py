@@ -10,7 +10,7 @@ Pipeline:
   • **Generic rep counter** — per-exercise angle-threshold config selects
     which joint to track; a two-phase state machine (EXTENDED ↔ CONTRACTED)
     counts reps for any exercise without hardcoded curl logic.
-  • VBT fatigue flag: current rep > 1.3 × rolling mean duration
+  • VBT fatigue flag: current rep > 1.5 × warmup-baseline duration
   • JSON-serializable telemetry dict
 """
 

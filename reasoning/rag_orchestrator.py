@@ -65,6 +65,7 @@ from utils.logging_helpers import agent_log
 logger = logging.getLogger(__name__)
 
 _VECTOR_STORE_DIR = _PROJECT_ROOT / "vector_store"
+_GROQ_MODEL = "llama-3.1-8b-instant"
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -243,7 +244,7 @@ class SRRAGOrchestrator:
             )
 
         self.llm = ChatGroq(
-            model="llama-3.1-8b-instant",
+            model=_GROQ_MODEL,
             api_key=api_key,
             temperature=0,
         )

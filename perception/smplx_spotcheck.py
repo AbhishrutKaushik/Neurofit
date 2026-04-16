@@ -211,7 +211,12 @@ class SMPLXSpotChecker:
         """
         # ── Mock path — works on any hardware ──
         if self.mock_mode:
-            return {"spinal_alignment_score": 0.85, "posture_warning": "None"}
+            return {
+                "spinal_alignment_score": 0.85,
+                "posture_warning": "None",
+                "shoulder_symmetry": 0.90,
+                "mock": True,
+            }
 
         # ── Real path — requires PyTorch + SMPL-X ──
         try:
@@ -237,12 +242,19 @@ class SMPLXSpotChecker:
                 return {
                     "spinal_alignment_score": 0.85,
                     "posture_warning": "None",
+                    "shoulder_symmetry": 0.90,
+                    "mock": True,
                 }
 
             # Non-OOM errors: log and degrade gracefully.
             logger.exception("Unexpected error in SMPL-X inference.")
             self.mock_mode = True
-            return {"spinal_alignment_score": 0.85, "posture_warning": "None"}
+            return {
+                "spinal_alignment_score": 0.85,
+                "posture_warning": "None",
+                "shoulder_symmetry": 0.90,
+                "mock": True,
+            }
 
     # ------------------------------------------------------------------
     # Real inference path

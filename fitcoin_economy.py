@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import random
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -72,7 +71,7 @@ def _deterministic_price(product_name: str) -> int:
     Using a hash ensures the same product always gets the same price
     across page reloads (no flickering in the Streamlit UI).
     """
-    digest = int(hashlib.md5(product_name.encode()).hexdigest(), 16)
+    digest = int(hashlib.md5(product_name.encode("utf-8")).hexdigest(), 16)
     steps = (_MAX_COIN_PRICE - _MIN_COIN_PRICE) // _COIN_STEP
     return _MIN_COIN_PRICE + (digest % (steps + 1)) * _COIN_STEP
 

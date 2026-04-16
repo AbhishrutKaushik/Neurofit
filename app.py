@@ -393,6 +393,15 @@ _SYMMETRY_THRESHOLD = 15.0
 _ECCENTRIC_RATIO_MIN = 0.6
 
 
+def _drain_queue_non_blocking(q: queue.Queue) -> None:
+    """Drain a queue without blocking; used when resetting workout state."""
+    while True:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            break
+
+
 def _instant_form_cue(rep_count: int, telemetry: dict) -> str:
     """Analyse joint angles and timing to produce a spoken coaching cue
     in ~0 ms — no API call, pure local math on the telemetry dict."""
@@ -1095,14 +1104,8 @@ with tab_workout:
                 _vs.allowed_labels = set()
                 _vs.session_gen += 1
                 tts.flush()
-                try:
-                    _rep_q.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    _rag_q.get_nowait()
-                except queue.Empty:
-                    pass
+                _drain_queue_non_blocking(_rep_q)
+                _drain_queue_non_blocking(_rag_q)
                 st.session_state.fatigue_toast_shown = False
                 st.rerun()
         elif not _workout_active and st.session_state.get("workout_phase", "SETUP") == "SETUP":
@@ -1182,14 +1185,8 @@ with tab_workout:
                 _vs.allowed_labels = set()
                 _vs.session_gen += 1
                 tts.flush()
-                try:
-                    _rep_q.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    _rag_q.get_nowait()
-                except queue.Empty:
-                    pass
+                _drain_queue_non_blocking(_rep_q)
+                _drain_queue_non_blocking(_rag_q)
                 st.session_state.fatigue_toast_shown = False
                 st.rerun()
 
@@ -1466,14 +1463,8 @@ with tab_workout:
             if stop_pressed:
                 _vs.session_gen += 1
                 tts.flush()
-                try:
-                    _rep_q.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    _rag_q.get_nowait()
-                except queue.Empty:
-                    pass
+                _drain_queue_non_blocking(_rep_q)
+                _drain_queue_non_blocking(_rag_q)
                 w = st.session_state.get("_ip_worker")
                 if w and w.running:
                     w.stop()
@@ -1602,14 +1593,8 @@ with tab_workout:
             if st.button("🔄 Clear Session", width="stretch", type="secondary"):
                 _vs.session_gen += 1
                 tts.flush()
-                try:
-                    _rep_q.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    _rag_q.get_nowait()
-                except queue.Empty:
-                    pass
+                _drain_queue_non_blocking(_rep_q)
+                _drain_queue_non_blocking(_rag_q)
                 with _vs.lock:
                     st.session_state.fitcoin_balance = _vs.coins_earned
                 tracker.reset()
