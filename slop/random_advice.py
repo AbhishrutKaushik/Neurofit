@@ -18,6 +18,15 @@ def pick_advice(seed: int | None = None) -> str:
     return rng.choice(ADVICE)
 
 
-if __name__ == "__main__":
-    print(pick_advice())
+def preview_advice(count: int = 3, seed: int | None = None) -> list[str]:
+    if count <= 0:
+        return []
+    rng = random.Random(seed)
+    return [rng.choice(ADVICE) for _ in range(count)]
 
+
+if __name__ == "__main__":
+    print("Single:", pick_advice())
+    print("Preview:")
+    for tip in preview_advice(3):
+        print("-", tip)
